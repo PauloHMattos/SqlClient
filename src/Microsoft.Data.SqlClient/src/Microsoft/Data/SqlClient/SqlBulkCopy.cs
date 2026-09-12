@@ -1068,19 +1068,16 @@ EXEC {CatalogName}..{TableCollationsStoredProc} N'{SchemaName}.{TableName}';
             else
             {
                 Debug.Assert(_isAsyncBulkCopy, "Execution pended when not doing async bulk copy");
-                return executeTask.ContinueWith(t =>
-                {
-                    Debug.Assert(!t.IsCanceled, "Execution task was canceled");
-                    if (t.IsFaulted)
-                    {
-                        throw t.Exception.InnerException;
-                    }
-                    else
-                    {
-                        RunParserReliably();
-                    }
-                }, TaskScheduler.Default);
+                return AwaitSubmitUpdateBulkCommandAsync(executeTask);
             }
+        }
+
+        // Awaits a pended update-bulk command execution, then reliably runs the
+        // parser. Only reached when TdsExecuteSQLBatch did not complete synchronously.
+        private async Task AwaitSubmitUpdateBulkCommandAsync(Task executeTask)
+        {
+            await executeTask.ConfigureAwait(false);
+            RunParserReliably();
         }
 
         // Starts writing the Bulkcopy data stream
