@@ -2786,212 +2786,188 @@ EXEC {CatalogName}..{TableCollationsStoredProc} N'{SchemaName}.{TableName}';
         }
 
         // Copies all the batches in a loop. One iteration for one batch.
-        // state variable is essentially not needed. (however, _hasMoreRowToCopy might be thought as a state variable)
-        // Returned Task could be null in two cases: (1) _isAsyncBulkCopy == false, or (2) _isAsyncBulkCopy == true but all async writes finished synchronously.
+        // Copies all the batches in a loop, one iteration per batch.
+        // Returns null when every batch was copied synchronously; otherwise returns
+        // a Task that completes when all batches are copied (or faults/cancels).
         private Task CopyBatchesAsync(BulkCopySimpleResultSet internalResults, string updateBulkCommandText, CancellationToken cts, TaskCompletionSource<object> source = null)
         {
-            Debug.Assert(source == null || !source.Task.IsCompleted, "Called into CopyBatchesAsync with a completed task!");
+            Debug.Assert(source == null, "CopyBatchesAsync no longer threads a caller-provided source");
             try
             {
                 while (_hasMoreRowToCopy)
                 {
-                    //pre->before every batch: Transaction, BulkCmd and metadata are done.
-                    SqlConnectionInternal internalConnection = _connection.GetOpenTdsConnection();
-
-                    if (IsCopyOption(SqlBulkCopyOptions.UseInternalTransaction))
-                    { //internal transaction is started prior to each batch if the Option is set.
-                        internalConnection.ThreadHasParserLockForClose = true;     // In case of error, tell the connection we already have the parser lock
-                        try
-                        {
-                            _internalTransaction = _connection.BeginTransaction();
-                        }
-                        finally
-                        {
-                            internalConnection.ThreadHasParserLockForClose = false;
-                        }
-                    }
+                    BeginInternalTransactionIfNeeded();
 
                     Task commandTask = SubmitUpdateBulkCommand(updateBulkCommandText);
-
-                    if (commandTask == null)
+                    if (commandTask != null)
                     {
-                        Task continuedTask = CopyBatchesAsyncContinued(internalResults, updateBulkCommandText, cts, source);
-                        if (continuedTask != null)
-                        {
-                            // Continuation will take care of re-calling CopyBatchesAsync
-                            return continuedTask;
-                        }
+                        // The update-bulk command pended: run this batch and the rest
+                        // of the copy on the async path.
+                        return CopyBatchesLoopAsync(commandTask, internalResults, updateBulkCommandText, cts);
                     }
-                    else
-                    {
-                        Debug.Assert(_isAsyncBulkCopy, "Task should not pend while doing sync bulk copy");
-                        if (source == null)
-                        {
-                            source = new TaskCompletionSource<object>();
-                        }
 
-                        AsyncHelper.ContinueTaskWithState(
-                            commandTask,
-                            source,
-                            state: this,
-                            onSuccess: (object state) =>
-                            {
-                                SqlBulkCopy sqlBulkCopy = (SqlBulkCopy)state;
-                                Task continuedTask = sqlBulkCopy.CopyBatchesAsyncContinued(internalResults, updateBulkCommandText, cts, source);
-                                if (continuedTask == null)
-                                {
-                                    // Continuation finished sync, recall into CopyBatchesAsync to continue
-                                    sqlBulkCopy.CopyBatchesAsync(internalResults, updateBulkCommandText, cts, source);
-                                }
-                            });
-                        return source.Task;
+                    Task batchTask = CopySingleBatchAsync(internalResults, cts);
+                    if (batchTask != null)
+                    {
+                        return AwaitThenCopyBatchesLoopAsync(batchTask, internalResults, updateBulkCommandText, cts);
                     }
                 }
             }
             catch (Exception ex) when (ADP.IsCatchableExceptionType(ex))
             {
-                if (source != null)
+                if (_isAsyncBulkCopy)
                 {
-                    source.TrySetException(ex);
-                    return source.Task;
+                    return Task.FromException(ex);
                 }
-                else
+                throw;
+            }
+            return null;
+        }
+
+        // Begins a per-batch internal transaction when the option is set. Called
+        // before each batch is written.
+        private void BeginInternalTransactionIfNeeded()
+        {
+            if (IsCopyOption(SqlBulkCopyOptions.UseInternalTransaction))
+            {
+                SqlConnectionInternal internalConnection = _connection.GetOpenTdsConnection();
+                internalConnection.ThreadHasParserLockForClose = true; // In case of error, tell the connection we already have the parser lock
+                try
                 {
-                    throw;
+                    _internalTransaction = _connection.BeginTransaction();
                 }
+                finally
+                {
+                    internalConnection.ThreadHasParserLockForClose = false;
+                }
+            }
+        }
+
+        // Writes the metadata + a single batch of rows, then finishes the batch
+        // (WriteBulkCopyDone / RunParser / CommitTransaction). Returns null when the
+        // whole batch completed synchronously; otherwise a Task for the batch.
+        // On failure/cancellation the parser/stateObj/transaction are cleaned up.
+        private Task CopySingleBatchAsync(BulkCopySimpleResultSet internalResults, CancellationToken cts)
+        {
+            WriteMetaData(internalResults);
+
+            // Load encryption keys now (if needed)
+            _parser.LoadColumnEncryptionKeys(
+                _operationMetaData ?? internalResults[MetaDataResultId].MetaData,
+                _connection);
+
+            Task rowsTask = CopyRowsAsync(0, _savedBatchSize, cts); // Copies one batch of rows; sets _hasMoreRowToCopy.
+            if (rowsTask != null)
+            {
+                return FinishBatchAfterRowsAsync(rowsTask);
             }
 
-            // If we are here, then we finished everything
-            if (source != null)
+            return FinishSingleBatch();
+        }
+
+        // Synchronous tail of a batch: WriteBulkCopyDone, then RunParser +
+        // CommitTransaction. Returns null when the write completed synchronously,
+        // otherwise a Task that awaits the pending write before finishing.
+        private Task FinishSingleBatch()
+        {
+            Task writeTask = _parser.WriteBulkCopyDone(_stateObj);
+            if (writeTask == null)
             {
-                source.SetResult(null);
-                return source.Task;
-            }
-            else
-            {
+                RunParser();
+                CommitTransaction();
                 return null;
             }
+            return FinishBatchAfterWriteDoneAsync(writeTask);
         }
 
-        // Writes the MetaData and a single batch.
-        // If this returns true, then the caller is responsible for starting the next stage.
-        private Task CopyBatchesAsyncContinued(BulkCopySimpleResultSet internalResults, string updateBulkCommandText, CancellationToken cts, TaskCompletionSource<object> source)
+        // Awaits a pended batch of rows, then finishes the batch. Cleans up on
+        // failure/cancellation, matching the previous continuation's onFailure/
+        // onCancellation behavior.
+        private async Task FinishBatchAfterRowsAsync(Task rowsTask)
         {
-            Debug.Assert(source == null || !source.Task.IsCompleted, "Called into CopyBatchesAsync with a completed task!");
             try
             {
-                WriteMetaData(internalResults);
-
-                // Load encryption keys now (if needed)
-                _parser.LoadColumnEncryptionKeys(
-                    _operationMetaData ?? internalResults[MetaDataResultId].MetaData,
-                    _connection);
-
-                Task task = CopyRowsAsync(0, _savedBatchSize, cts); // This is copying 1 batch of rows and setting _hasMoreRowToCopy = true/false.
-
-                // post->after every batch
-                if (task != null)
-                {
-                    Debug.Assert(_isAsyncBulkCopy, "Task should not pend while doing sync bulk copy");
-                    if (source == null)
-                    {   // First time only
-                        source = new TaskCompletionSource<object>();
-                    }
-                    AsyncHelper.ContinueTaskWithState(
-                        task,
-                        source,
-                        state: this,
-                        onSuccess: state =>
-                        {
-                            Task continuedTask = state.CopyBatchesAsyncContinuedOnSuccess(internalResults, updateBulkCommandText, cts, source);
-                            if (continuedTask == null)
-                            {
-                                // Continuation finished sync, recall into CopyBatchesAsync to continue
-                                state.CopyBatchesAsync(internalResults, updateBulkCommandText, cts, source);
-                            }
-                        },
-                        onFailure: static (state, _) => state.CopyBatchesAsyncContinuedOnError(cleanupParser: false),
-                        onCancellation: static state => state.CopyBatchesAsyncContinuedOnError(cleanupParser: true));
-
-                    return source.Task;
-                }
-                else
-                {
-                    return CopyBatchesAsyncContinuedOnSuccess(internalResults, updateBulkCommandText, cts, source);
-                }
+                await rowsTask.ConfigureAwait(false);
             }
-            catch (Exception ex) when (ADP.IsCatchableExceptionType(ex))
+            catch (OperationCanceledException)
             {
-                if (source != null)
-                {
-                    source.TrySetException(ex);
-                    return source.Task;
-                }
-                else
-                {
-                    throw;
-                }
+                CopyBatchesAsyncContinuedOnError(cleanupParser: true);
+                throw;
+            }
+            catch
+            {
+                CopyBatchesAsyncContinuedOnError(cleanupParser: false);
+                throw;
+            }
+
+            Task finishTask = FinishSingleBatch();
+            if (finishTask != null)
+            {
+                await finishTask.ConfigureAwait(false);
             }
         }
 
-        // Takes care of finishing a single batch (write done, run parser, commit transaction).
-        // If this returns true, then the caller is responsible for starting the next stage.
-        private Task CopyBatchesAsyncContinuedOnSuccess(BulkCopySimpleResultSet internalResults, string updateBulkCommandText, CancellationToken cts, TaskCompletionSource<object> source)
+        // Awaits a pended WriteBulkCopyDone, then runs the parser and commits the
+        // batch transaction. Cleans up the parser if RunParser/CommitTransaction
+        // throw, matching the previous onFailure-only continuation (a cancellation
+        // of the write task itself propagates without extra cleanup, as before).
+        private async Task FinishBatchAfterWriteDoneAsync(Task writeTask)
         {
-            Debug.Assert(source == null || !source.Task.IsCompleted, "Called into CopyBatchesAsync with a completed task!");
+            await writeTask.ConfigureAwait(false);
             try
             {
-                Task writeTask = _parser.WriteBulkCopyDone(_stateObj);
-
-                if (writeTask == null)
-                {
-                    RunParser();
-                    CommitTransaction();
-
-                    return null;
-                }
-                else
-                {
-                    Debug.Assert(_isAsyncBulkCopy, "Task should not pend while doing sync bulk copy");
-                    if (source == null)
-                    {
-                        source = new TaskCompletionSource<object>();
-                    }
-
-                    AsyncHelper.ContinueTaskWithState(
-                        writeTask,
-                        source,
-                        state: this,
-                        onSuccess: state =>
-                        {
-                            try
-                            {
-                                state.RunParser();
-                                state.CommitTransaction();
-                            }
-                            catch (Exception)
-                            {
-                                state.CopyBatchesAsyncContinuedOnError(cleanupParser: false);
-                                throw;
-                            }
-
-                            // Always call back into CopyBatchesAsync
-                            state.CopyBatchesAsync(internalResults, updateBulkCommandText, cts, source);
-                        },
-                        onFailure: static (state, _ ) => state.CopyBatchesAsyncContinuedOnError(cleanupParser: false));
-                    return source.Task;
-                }
+                RunParser();
+                CommitTransaction();
             }
-            catch (Exception ex) when (ADP.IsCatchableExceptionType(ex))
+            catch
             {
-                if (source != null)
+                CopyBatchesAsyncContinuedOnError(cleanupParser: false);
+                throw;
+            }
+        }
+
+        // Async batch loop entered after the update-bulk command for the current
+        // batch pended. Awaits it, finishes the batch, then continues copying the
+        // remaining batches, awaiting only the steps that actually pend.
+        private async Task CopyBatchesLoopAsync(Task pendingCommand, BulkCopySimpleResultSet internalResults, string updateBulkCommandText, CancellationToken cts)
+        {
+            await pendingCommand.ConfigureAwait(false);
+
+            Task batchTask = CopySingleBatchAsync(internalResults, cts);
+            if (batchTask != null)
+            {
+                await batchTask.ConfigureAwait(false);
+            }
+
+            await CopyRemainingBatchesLoopAsync(internalResults, updateBulkCommandText, cts).ConfigureAwait(false);
+        }
+
+        // Async batch loop entered after a batch's rows pended.
+        private async Task AwaitThenCopyBatchesLoopAsync(Task pendingBatch, BulkCopySimpleResultSet internalResults, string updateBulkCommandText, CancellationToken cts)
+        {
+            await pendingBatch.ConfigureAwait(false);
+            await CopyRemainingBatchesLoopAsync(internalResults, updateBulkCommandText, cts).ConfigureAwait(false);
+        }
+
+        // The batch loop expressed with async/await. Used once the copy has pended
+        // at least once. Per batch: begin optional transaction, submit update-bulk
+        // command, write the batch, finish it - awaiting only pending steps.
+        private async Task CopyRemainingBatchesLoopAsync(BulkCopySimpleResultSet internalResults, string updateBulkCommandText, CancellationToken cts)
+        {
+            while (_hasMoreRowToCopy)
+            {
+                BeginInternalTransactionIfNeeded();
+
+                Task commandTask = SubmitUpdateBulkCommand(updateBulkCommandText);
+                if (commandTask != null)
                 {
-                    source.TrySetException(ex);
-                    return source.Task;
+                    await commandTask.ConfigureAwait(false);
                 }
-                else
+
+                Task batchTask = CopySingleBatchAsync(internalResults, cts);
+                if (batchTask != null)
                 {
-                    throw;
+                    await batchTask.ConfigureAwait(false);
                 }
             }
         }
